@@ -3,9 +3,23 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const axios = require('axios');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS shop_tokens (
+    shop TEXT PRIMARY KEY,
+    access_token TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+  )
+`).catch(console.error);
 
 app.use(bodyParser.json({
   verify: (req, res, buf) => { req.rawBody = buf; }
@@ -27,37 +41,42 @@ app.get('/', (req, res) => {
 app.get('/api/shopify/install', (req, res) => {
   const shop = req.query.shop;
   if (!shop) return res.status(400).send('Missing shop parameter');
-  
+
   const redirectUri = `${process.env.SHOPIFY_APP_URL}/api/shopify/callback`;
   const scopes = 'read_customers,write_customers,read_orders,read_discounts,write_discounts,write_themes';
-  
+
   const installUrl = `https://${shop}/admin/oauth/authorize?client_id=${process.env.SHOPIFY_API_KEY}&scope=${scopes}&redirect_uri=${redirectUri}`;
-  
+
   res.redirect(installUrl);
 });
 
 // Step 2: Shopify OAuth - Callback
 app.get('/api/shopify/callback', async (req, res) => {
   const { shop, code } = req.query;
-  
+
   try {
-    // Exchange code for access token
     const tokenRes = await axios.post(`https://${shop}/admin/oauth/access_token`, {
       client_id: process.env.SHOPIFY_API_KEY,
       client_secret: process.env.SHOPIFY_API_SECRET,
       code
     });
-    
+
     const accessToken = tokenRes.data.access_token;
-    
+
+    // Store token in database
+    await pool.query(
+      'INSERT INTO shop_tokens (shop, access_token) VALUES ($1, $2) ON CONFLICT (shop) DO UPDATE SET access_token = $2',
+      [shop, accessToken]
+    );
+
     // Register publisher on Targetise
     try {
       const shopRes = await axios.get(`https://${shop}/admin/api/2026-04/shop.json`, {
         headers: { 'X-Shopify-Access-Token': accessToken }
       });
-      
+
       const shopData = shopRes.data.shop;
-      
+
       await axios.post('https://targetise.com/api/publishers/register', {
         shop: shop,
         name: shopData.name,
@@ -67,11 +86,7 @@ app.get('/api/shopify/callback', async (req, res) => {
     } catch (e) {
       console.log('Targetise registration error:', e.message);
     }
-    
-    // Store token (in production use a database)
-    global.shopTokens = global.shopTokens || {};
-    global.shopTokens[shop] = accessToken;
-    
+
     res.send(`
       <html><body style="font-family:sans-serif;text-align:center;padding:50px">
         <h1>✅ Targetise Installed!</h1>
@@ -91,14 +106,15 @@ app.post('/api/webhooks/targetise', async (req, res) => {
   const signature = req.headers['x-targetise-signature'];
   const hmac = crypto.createHmac('sha256', process.env.TARGETISE_WEBHOOK_SECRET)
     .update(req.rawBody).digest('hex');
-  
+
   if (signature !== hmac) return res.status(401).send('Unauthorized');
-  
+
   const { event, shop, voucher_code, discount_text, advertiser_name, expires } = req.body;
-  const accessToken = global.shopTokens?.[shop];
-  
-  if (!accessToken) return res.status(404).send('Shop not found');
-  
+
+  const result = await pool.query('SELECT access_token FROM shop_tokens WHERE shop = $1', [shop]);
+  if (!result.rows.length) return res.status(404).send('Shop not found');
+  const accessToken = result.rows[0].access_token;
+
   try {
     if (event === 'campaign.accepted') {
       await injectVoucherToEmail(shop, accessToken, {
@@ -118,27 +134,27 @@ app.post('/api/webhooks/targetise', async (req, res) => {
 });
 
 // Shopify app uninstalled webhook
-app.post('/api/webhooks/shopify/app-uninstalled', (req, res) => {
+app.post('/api/webhooks/shopify/app-uninstalled', async (req, res) => {
   const shop = req.headers['x-shopify-shop-domain'];
-  if (global.shopTokens?.[shop]) delete global.shopTokens[shop];
+  await pool.query('DELETE FROM shop_tokens WHERE shop = $1', [shop]);
   res.json({ success: true });
 });
 
 // Inject voucher into order confirmation email
 async function injectVoucherToEmail(shop, accessToken, voucher) {
   const headers = { 'X-Shopify-Access-Token': accessToken };
-  
+
   const templatesRes = await axios.get(
     `https://${shop}/admin/api/2026-04/email_templates.json`,
     { headers }
   );
-  
+
   const orderTemplate = templatesRes.data.email_templates.find(
     t => t.name === 'order_confirmation'
   );
-  
+
   if (!orderTemplate) throw new Error('Order confirmation template not found');
-  
+
   const voucherBlock = `
 <!-- TARGETISE_VOUCHER_START -->
 <div style="margin-top:30px;padding:20px;border:2px dashed #e8ff47;border-radius:8px;text-align:center;background:#f9f9f9;">
@@ -151,7 +167,7 @@ async function injectVoucherToEmail(shop, accessToken, voucher) {
   let body = orderTemplate.body;
   body = body.replace(/<!-- TARGETISE_VOUCHER_START -->[\s\S]*<!-- TARGETISE_VOUCHER_END -->/g, '');
   body = body.replace('</body>', voucherBlock + '</body>');
-  
+
   await axios.put(
     `https://${shop}/admin/api/2026-04/email_templates/${orderTemplate.id}.json`,
     { email_template: { id: orderTemplate.id, body } },
@@ -162,21 +178,21 @@ async function injectVoucherToEmail(shop, accessToken, voucher) {
 // Remove voucher from order confirmation email
 async function removeVoucherFromEmail(shop, accessToken) {
   const headers = { 'X-Shopify-Access-Token': accessToken };
-  
+
   const templatesRes = await axios.get(
     `https://${shop}/admin/api/2026-04/email_templates.json`,
     { headers }
   );
-  
+
   const orderTemplate = templatesRes.data.email_templates.find(
     t => t.name === 'order_confirmation'
   );
-  
+
   if (!orderTemplate) return;
-  
+
   let body = orderTemplate.body;
   body = body.replace(/<!-- TARGETISE_VOUCHER_START -->[\s\S]*<!-- TARGETISE_VOUCHER_END -->/g, '');
-  
+
   await axios.put(
     `https://${shop}/admin/api/2026-04/email_templates/${orderTemplate.id}.json`,
     { email_template: { id: orderTemplate.id, body } },
