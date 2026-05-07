@@ -16,6 +16,13 @@ app.get('/api/healthz', (req, res) => {
   res.json({ status: 'ok', app: 'Targetise Shopify Plugin' });
 });
 
+// Root route - Shopify hits this to start install
+app.get('/', (req, res) => {
+  const shop = req.query.shop;
+  if (!shop) return res.send('Targetise Shopify Plugin is running.');
+  res.redirect(`/api/shopify/install?shop=${shop}`);
+});
+
 // Step 1: Shopify OAuth - Install
 app.get('/api/shopify/install', (req, res) => {
   const shop = req.query.shop;
